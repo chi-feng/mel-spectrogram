@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>MEL Spectrogram with Crosshair</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+            height: 100%;
+            width: 100%;
+        }
+
+        /* Base spectrogram canvas */
+        #spectrogram {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: black;
+            z-index: 1;
+            cursor: none;
+            /* Hides default mouse cursor over this canvas */
+
+            /* lower z-index so overlay can sit on top */
+        }
+
+        /* Overlay canvas for crosshair */
+        #overlay {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            /* allows mouse events to pass through to spectrogram if needed */
+            z-index: 2;
+            /* higher z-index so it is on top of the spectrogram */
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="spectrogram"></canvas>
+    <!-- New canvas for the crosshair overlay -->
+    <canvas id="overlay"></canvas>
+    <!-- New frequency display element -->
+    <div id="freqDisplay" style="position: fixed; left: 0; top: 0; color: #fff; 
+        background: rgba(0,0,0,0.25); padding: 4px; 
+        pointer-events: none; font-family: sans-serif; z-index: 3;
+        font-family: Consolas, monospace;
+        white-space: pre;"></div>
+    <script src="colormaps.js"></script>
+
+    <script>
+        (async () => {
+            // ======== CONFIGURATION ========
+            const FFT_SIZE = 16384;               // Size of the FFT buffer
+            const MEL_BINS = 512;                 // Number of Mel bands
+            const MIN_FREQ = 20;                  // Minimum frequency range for Mel
+            const MAX_FREQ = 8000;               // Maximum frequency range for Mel
+            const SMOOTHING_TIME_CONSTANT = 0.0;  // Smoothing factor for the AnalyserNode
+            // ==============================
+
+            // Grab references to our two canvases
+            const canvas = document.getElementById('spectrogram');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+            const overlay = document.getElementById('overlay');
+            const overlayCtx = overlay.getContext('2d');
+
+            // Keep track of mouse position for crosshair
+            let mouseX = 0, mouseY = 0;
+
+            function resizeCanvas() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                overlay.width = window.innerWidth;
+                overlay.height = window.innerHeight;
+            }
+            window.addEventListener('resize', resizeCanvas);
+            resizeCanvas();
+
+            const freqDisplay = document.getElementById('freqDisplay');
+
+            document.addEventListener('mousemove', (event) => {
+
+                const melMin = freqToMel(MIN_FREQ);
+                const melMax = freqToMel(MAX_FREQ);
+
+                mouseX = event.clientX;
+                mouseY = event.clientY;
+
+                // Convert mouseY to frequency
+                const fraction = 1 - (mouseY / overlay.height);
+                const melCoord = melMin + fraction * (melMax - melMin);
+                const freqCoord = melToFreq(melCoord);
+
+                const note = freqToNoteData(freqCoord);
+                const offset = note.centOffset.toFixed(0);
+                const offsetSign = offset > 0 ? '+' : '-';
+
+                // Update the display text and position
+                freqDisplay.innerHTML = `${String(Math.round(freqCoord)).padStart(4, ' ')}&nbsp;Hz ${String(note.noteName + note.octave).padEnd(3, ' ')} ${offsetSign} ${Math.abs(offset)}¢`;
+
+                // (Optional) Move it near the mouse pointer
+                freqDisplay.style.left = (mouseX + 12) + 'px';
+                freqDisplay.style.top = (mouseY + 12) + 'px';
+            });
+
+            function drawCrosshair() {
+                // Clear previous crosshair
+                overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+                // Draw new crosshair lines
+                overlayCtx.strokeStyle = 'white';
+                overlayCtx.globalAlpha = 1.0;
+                overlayCtx.lineWidth = 1;
+
+                overlayCtx.beginPath();
+                // Vertical line
+                overlayCtx.moveTo(mouseX, 0);
+                overlayCtx.lineTo(mouseX, overlay.height);
+                // Horizontal line
+                overlayCtx.moveTo(0, mouseY);
+                overlayCtx.lineTo(overlay.width, mouseY);
+                overlayCtx.stroke();
+
+                // Calculate and draw overtones
+                const melMin = freqToMel(MIN_FREQ);
+                const melMax = freqToMel(MAX_FREQ);
+
+                // Get the fundamental frequency from current mouse position
+                const fraction = 1 - (mouseY / overlay.height);
+                const melCoord = melMin + fraction * (melMax - melMin);
+                const fundamentalFreq = melToFreq(melCoord);
+
+                // Draw overtones (first 5 harmonics)
+                overlayCtx.fillStyle = 'white';
+                for (let i = 1; i <= 6; i++) {
+                    const overtoneFreq = fundamentalFreq * i;
+                    if (overtoneFreq <= MAX_FREQ) {
+                        // Convert frequency back to y-coordinate
+                        const overtoneMel = freqToMel(overtoneFreq);
+                        const overtoneFraction = (overtoneMel - melMin) / (melMax - melMin);
+                        const overtoneY = overlay.height * (1 - overtoneFraction);
+
+                        // Draw circle with decreasing size
+                        const radius = 4 - 0.5 * (i - 2);  // Start at 4px radius, decrease by 1 each time
+                        overlayCtx.beginPath();
+                        overlayCtx.arc(mouseX, overtoneY, radius, 0, 2 * Math.PI);
+                        overlayCtx.fill();
+                    }
+                }
+
+                // Keep updating
+                requestAnimationFrame(drawCrosshair);
+            }
+            drawCrosshair();
+
+            // Helper: convert frequency in Hz to Mel
+            function freqToMel(freq) {
+                return 2595 * Math.log10(1 + freq / 700);
+            }
+
+            // Helper: convert Mel back to frequency
+            function melToFreq(mel) {
+                return 700 * (10 ** (mel / 2595) - 1);
+            }
+
+            function freqToNoteData(freq) {
+                // 1) Convert frequency to fractional MIDI note
+                const midiNoteFloat = 12 * Math.log2(freq / 440) + 69;
+
+                // 2) Round to nearest MIDI note for naming
+                const midiNote = Math.round(midiNoteFloat);
+
+                // 3) Calculate the cents offset from that nearest note
+                const centOffset = 100 * (midiNoteFloat - midiNote);
+
+                // 4) Map MIDI note to name
+                const noteNames = ["C", "C#", "D", "D#", "E",
+                    "F", "F#", "G", "G#", "A",
+                    "A#", "B"];
+                const noteIndex = midiNote % 12;
+                const noteName = noteNames[noteIndex];
+                // Some define octave = (midiNote / 12) - 1
+                const octave = Math.floor(midiNote / 12) - 1;
+
+                return {
+                    freq,             // input frequency
+                    midiNoteFloat,    // fractional MIDI note
+                    midiNote,         // nearest integer MIDI note
+                    noteName,         // e.g. "F#"
+                    octave,           // e.g. 4
+                    centOffset        // e.g. +3.7 => 3.7 cents sharp
+                };
+            }
+
+            // Build a set of center frequencies for the Mel filter bank
+            function createMelFilterBank(numMelBins, sampleRate, fftSize) {
+                // Mel scale boundaries
+                const melMin = freqToMel(MIN_FREQ);
+                const melMax = freqToMel(MAX_FREQ);
+
+                // Create equally spaced points between melMin and melMax
+                const melPoints = new Float32Array(numMelBins + 2);
+                for (let i = 0; i < melPoints.length; i++) {
+                    melPoints[i] = melMin + (i / (numMelBins + 1)) * (melMax - melMin);
+                }
+
+                // Convert mel points back to frequency domain
+                const freqPoints = new Float32Array(numMelBins + 2);
+                for (let i = 0; i < freqPoints.length; i++) {
+                    freqPoints[i] = melToFreq(melPoints[i]);
+                }
+
+                // Convert these frequencies to FFT bin indices
+                const binPoints = new Uint32Array(numMelBins + 2);
+                for (let i = 0; i < freqPoints.length; i++) {
+                    binPoints[i] = Math.floor((fftSize + 1) * freqPoints[i] / sampleRate);
+                }
+
+                // Create the filter bank: each row is one Mel bin
+                const filterBank = [];
+                for (let i = 0; i < numMelBins; i++) {
+                    filterBank[i] = new Float32Array(fftSize / 2);
+                    for (let j = 0; j < fftSize / 2; j++) {
+                        filterBank[i][j] = 0.0;
+                    }
+
+                    const start = binPoints[i];
+                    const center = binPoints[i + 1];
+                    const end = binPoints[i + 2];
+
+                    for (let j = start; j < center; j++) {
+                        filterBank[i][j] = (j - start) / (center - start);
+                    }
+                    for (let j = center; j < end; j++) {
+                        filterBank[i][j] = (end - j) / (end - center);
+                    }
+                }
+
+                return filterBank;
+            }
+
+            // Apply mel filter bank to a magnitude spectrum
+            function applyMelFilterBank(magnitude, filterBank) {
+                const melEnergies = new Float32Array(filterBank.length);
+                for (let i = 0; i < filterBank.length; i++) {
+                    let sum = 0;
+                    for (let j = 0; j < magnitude.length; j++) {
+                        sum += magnitude[j] * filterBank[i][j];
+                    }
+                    melEnergies[i] = sum;
+                }
+                return melEnergies;
+            }
+
+            // Request access to the microphone
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: true
+                }
+            });
+            const audioContext = new AudioContext();
+            const source = audioContext.createMediaStreamSource(stream);
+
+            // Create an AnalyserNode for FFT
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = FFT_SIZE;
+            analyser.smoothingTimeConstant = SMOOTHING_TIME_CONSTANT;
+            source.connect(analyser);
+
+            // Prepare data arrays
+            const freqData = new Float32Array(analyser.frequencyBinCount);
+
+            // Precompute the mel filter bank
+            const filterBank = createMelFilterBank(MEL_BINS, audioContext.sampleRate, analyser.fftSize);
+
+            // Main spectrogram draw loop
+            function drawSpectrogram() {
+                requestAnimationFrame(drawSpectrogram);
+
+                // Get the current frequency data (dB scale)
+                analyser.getFloatFrequencyData(freqData);
+
+                // Convert dB values to magnitude
+                const magnitude = new Float32Array(freqData.length);
+                for (let i = 0; i < freqData.length; i++) {
+                    // dB to linear magnitude
+                    magnitude[i] = Math.pow(10, freqData[i] / 20);
+                }
+
+                // Calculate the Mel energies
+                const melEnergies = applyMelFilterBank(magnitude, filterBank);
+
+                // Shift the existing spectrogram image to the left by 1 pixel
+                const width = canvas.width;
+                const height = canvas.height;
+                const imageData = ctx.getImageData(1, 0, width - 1, height);
+                ctx.putImageData(imageData, 0, 0);
+
+                // Draw a new vertical line (the new column) on the right
+                // ctx.fillStyle = 'black';
+                // ctx.fillRect(width - 1, 0, 1, height);
+
+                // Convert mel energies to color intensities (using 'viridis' colormap from colormaps.js)
+                for (let i = 0; i < MEL_BINS; i++) {
+                    const melVal = melEnergies[i];
+                    // Adjust these constants to fit your desired dynamic range
+                    const alpha = 3000;  // bigger alpha = more boost to smaller signals
+                    const scale = 150;
+                    const logVal = Math.log10(1 + melVal * alpha) * scale;
+                    const normalizedIntensity = Math.max(0, Math.min(1, logVal / scale));
+
+                    // Get color from viridis colormap
+                    const colorIndex = Math.floor(normalizedIntensity * (COLORMAPS.viridis.length - 1));
+                    const color = COLORMAPS.viridis[colorIndex];
+
+                    // Convert from 0-1 float to 0-255
+                    const r = Math.floor(color[0] * 255);
+                    const g = Math.floor(color[1] * 255);
+                    const b = Math.floor(color[2] * 255);
+
+                    // Determine y boundaries for this mel bin
+                    const yStart = Math.floor(height - (i / MEL_BINS) * height);
+                    const yEnd = Math.floor(height - ((i + 1) / MEL_BINS) * height);
+
+                    ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+                    ctx.fillRect(width - 1, yEnd, 1, yStart - yEnd);
+                }
+            }
+
+            drawSpectrogram();
+        })();
+    </script>
+</body>
+
+</html>
