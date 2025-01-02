@@ -52,9 +52,9 @@
     <!-- New canvas for the crosshair overlay -->
     <canvas id="overlay"></canvas>
     <!-- New frequency display element -->
-    <div id="freqDisplay" style="position: fixed; left: 0; top: 0; color: #fff; 
+    <div id="freqDisplay" style="position: fixed; right: 0; top: 0; color: #fff; 
         background: rgba(0,0,0,0.25); padding: 4px; 
-        pointer-events: none; font-family: sans-serif; z-index: 3;
+        pointer-events: none; font-size: 24px;z-index: 3;
         font-family: Consolas, monospace;
         white-space: pre;"></div>
     <script src="colormaps.js"></script>
@@ -108,11 +108,11 @@
                 const offsetSign = offset > 0 ? '+' : '-';
 
                 // Update the display text and position
-                freqDisplay.innerHTML = `${String(Math.round(freqCoord)).padStart(4, ' ')}&nbsp;Hz ${String(note.noteName + note.octave).padEnd(3, ' ')} ${offsetSign} ${Math.abs(offset)}¢`;
+                freqDisplay.innerHTML = `${String(Math.round(freqCoord)).padEnd(4, ' ')}&nbsp;Hz&nbsp;&nbsp;${String(note.noteName + note.octave).padEnd(3, ' ')} ${offsetSign}${String(Math.abs(offset)).padStart(3, ' ')}¢`;
 
                 // (Optional) Move it near the mouse pointer
-                freqDisplay.style.left = (mouseX + 12) + 'px';
-                freqDisplay.style.top = (mouseY + 12) + 'px';
+                // freqDisplay.style.left = (mouseX + 12) + 'px';
+                // freqDisplay.style.top = (mouseY + 12) + 'px';
             });
 
             function drawCrosshair() {
@@ -153,10 +153,16 @@
                         const overtoneY = overlay.height * (1 - overtoneFraction);
 
                         // Draw circle with decreasing size
-                        const radius = 4 - 0.5 * (i - 2);  // Start at 4px radius, decrease by 1 each time
+                        const radius = 4 - 0.8 * (i - 2);  // Start at 4px radius, decrease by 1 each time
+                        overlayCtx.globalAlpha = radius / 4;
                         overlayCtx.beginPath();
                         overlayCtx.arc(mouseX, overtoneY, radius, 0, 2 * Math.PI);
                         overlayCtx.fill();
+                        // Horizontal line
+                        overlayCtx.globalAlpha = radius / 10;
+                        overlayCtx.moveTo(0, overtoneY);
+                        overlayCtx.lineTo(overlay.width, overtoneY);
+                        overlayCtx.stroke();
                     }
                 }
 
@@ -318,8 +324,8 @@
                 for (let i = 0; i < MEL_BINS; i++) {
                     const melVal = melEnergies[i];
                     // Adjust these constants to fit your desired dynamic range
-                    const alpha = 3000;  // bigger alpha = more boost to smaller signals
-                    const scale = 150;
+                    const alpha = 2000;  // bigger alpha = more boost to smaller signals
+                    const scale = 100;
                     const logVal = Math.log10(1 + melVal * alpha) * scale;
                     const normalizedIntensity = Math.max(0, Math.min(1, logVal / scale));
 
