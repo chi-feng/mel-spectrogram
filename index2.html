@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>MEL Spectrogram</title>
+    <link rel="stylesheet" href="screen.css">
+</head>
+
+<body>
+    <canvas id="spectrogram"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="freqDisplay"></div>
+    <div class="controls">
+        <button id="micButton" class="control-button">Use Microphone</button>
+        <button id="fileButton" class="control-button">Load Audio File</button>
+        <button id="overtoneSuppress" class="control-button">Suppress Harmonics</button>
+    </div>
+    <input type="file" id="fileInput" accept="audio/*" style="display: none;">
+    <script src="colormaps.js"></script>
+    <script>
+        (async () => {
+            // ======== CONFIGURATION ========
+            const CONFIG = {
+                fft: {
+                    size: 32768,
+                    smoothing: 0.0
+                },
+                midi: {
+                    start: 21,
+                    end: 108
+                },
+                display: {
+                    alpha: 100,
+                    scale: 50
+                }
+            };
+            const NUM_NOTES = CONFIG.midi.end - CONFIG.midi.start + 1;
+
+            const OVERTONE_CONFIG = {
+                decayFactor: 0.5,  // Each overtone will be suppressed by this factor more than the previous
+                maxOvertones: 7,   // Number of overtones to consider
+                threshold: 0.0    // Minimum energy level to trigger suppression
+            };
+
+            // ======== UTILITY FUNCTIONS ========
+            const utils = {
+                midiToFreq: midi => 440 * Math.pow(2, (midi - 69) / 12),
+
+                freqToNoteData(freq) {
+                    const midiNoteFloat = 12 * Math.log2(freq / 440) + 69;
+                    const midiNote = Math.round(midiNoteFloat);
+                    const centOffset = 100 * (midiNoteFloat - midiNote);
+
+                    const noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+                    return {
+                        freq,
+                        midiNote,
+                        noteName: noteNames[midiNote % 12],
+                        octave: Math.floor(midiNote / 12) - 1,
+                        centOffset
+                    };
+                },
+
+                createNoteFilterBank(sampleRate, fftSize) {
+                    return Array.from({ length: NUM_NOTES }, (_, i) => {
+                        const midi = CONFIG.midi.start + i;
+                        const centerFreq = utils.midiToFreq(midi);
+                        const lowerFreq = centerFreq * Math.pow(2, -50 / 1200);
+                        const upperFreq = centerFreq * Math.pow(2, 50 / 1200);
+
+                        // Calculate exact (floating-point) bin positions
+                        const centerBinExact = centerFreq * fftSize / sampleRate;
+                        let lowerBin = Math.floor(lowerFreq * fftSize / sampleRate);
+                        let upperBin = Math.ceil(upperFreq * fftSize / sampleRate);
+
+                        // Ensure we have at least one bin width on each side
+                        if (lowerBin >= centerBinExact) {
+                            lowerBin = Math.floor(centerBinExact - 1);
+                        }
+                        if (upperBin <= centerBinExact) {
+                            upperBin = Math.ceil(centerBinExact + 1);
+                        }
+
+                        // Store only the non-zero range and its starting position
+                        const filterValues = new Float32Array(upperBin - lowerBin + 1);
+
+                        // Create triangular filter with interpolated peak
+                        for (let j = 0; j < filterValues.length; j++) {
+                            const currentBin = lowerBin + j;
+                            if (currentBin <= centerBinExact) {
+                                filterValues[j] = (currentBin - lowerBin) / (centerBinExact - lowerBin);
+                            } else {
+                                filterValues[j] = (upperBin - currentBin) / (upperBin - centerBinExact);
+                            }
+                        }
+
+                        if (i < 20) {
+                            console.log(JSON.stringify({
+                                start: lowerBin,
+                                center: centerBinExact,
+                                values: filterValues
+                            }, null, 2));
+                        }
+
+                        return {
+                            start: lowerBin,
+                            values: filterValues
+                        };
+                    });
+                },
+
+                applyMelFilterBank(magnitude, filterBank) {
+                    return filterBank.map(filter => {
+                        let sum = 0;
+                        const { start, values } = filter;
+                        for (let j = 0; j < values.length; j++) {
+                            if (start + j < magnitude.length) {
+                                sum += magnitude[start + j] * values[j];
+                            }
+                        }
+                        return sum;
+                    });
+                }
+            };
+
+            const overtoneUtils = {
+                // Create mapping of each note to its overtones
+                createOvertoneMap() {
+                    const overtoneMap = new Array(NUM_NOTES);
+                    
+                    for (let i = 0; i < NUM_NOTES; i++) {
+                        const fundamental = utils.midiToFreq(CONFIG.midi.start + i);
+                        const overtones = [];
+                        
+                        for (let n = 2; n <= OVERTONE_CONFIG.maxOvertones; n++) {
+                            const overtoneFreq = fundamental * n;
+                            // Find the closest mel bin for this frequency
+                            const overtoneMidi = 12 * Math.log2(overtoneFreq / 440) + 69;
+                            const melBin = Math.round(overtoneMidi - CONFIG.midi.start);
+                            
+                            if (melBin < NUM_NOTES) {
+                                overtones.push({
+                                    bin: melBin,
+                                    multiplier: n
+                                });
+                            }
+                        }
+                        
+                        overtoneMap[i] = overtones;
+                    }
+                    return overtoneMap;
+                },
+
+                // Apply overtone suppression to mel energies
+                suppressOvertones(melEnergies) {
+                    const suppressed = new Float32Array(melEnergies);
+                    
+                    // Process from lowest to highest frequency
+                    for (let i = 0; i < suppressed.length; i++) {
+                        const energy = suppressed[i];
+                        
+                        if (energy > OVERTONE_CONFIG.threshold) {
+                            // Suppress overtones for this fundamental
+                            overtoneMap[i].forEach(({bin, multiplier}, index) => {
+                                const suppressionFactor = Math.pow(OVERTONE_CONFIG.decayFactor, index + 1);
+                                const suppressionAmount = energy * suppressionFactor;
+                                if (bin < suppressed.length) {
+                                    suppressed[bin] = Math.max(0, suppressed[bin] - suppressionAmount);
+                                }
+                            });
+                        }
+                    }
+                    
+                    return suppressed;
+                }
+            };
+
+            // ======== CANVAS SETUP ========
+            const canvas = {
+                spec: document.getElementById('spectrogram').getContext('2d', { willReadFrequently: true }),
+                overlay: document.getElementById('overlay').getContext('2d'),
+                freqDisplay: document.getElementById('freqDisplay'),
+                mouse: { x: 0, y: 0 },
+
+                resize() {
+                    const width = window.innerWidth;
+                    const spectrogramHeight = NUM_NOTES;  // Actual number of frequency bins
+
+                    // Set spectrogram to exact number of bins
+                    this.spec.canvas.width = width;
+                    this.spec.canvas.height = spectrogramHeight;
+                    
+                    // Set overlay to full viewport height
+                    this.overlay.canvas.width = width;
+                    this.overlay.canvas.height = window.innerHeight;
+                },
+
+                drawOverlay(mouseY) {
+                    const { width, height } = this.overlay.canvas;
+                    this.overlay.clearRect(0, 0, width, height);
+                    
+                    // Set blending mode to screen
+                    this.overlay.globalCompositeOperation = 'screen';
+                    
+                    // Calculate scaling factor between spectrogram and overlay
+                    const scaleFactor = height / this.spec.canvas.height;
+                    const keyHeight = height / NUM_NOTES;  // Height of each key in overlay pixels
+                    
+                    // Draw all semitone gridlines and backgrounds
+                    for (let midi = CONFIG.midi.start; midi <= CONFIG.midi.end; midi++) {
+                        const noteIndex = midi - CONFIG.midi.start;
+                        const y = (NUM_NOTES - 1 - noteIndex) * keyHeight;
+                        const isC = midi % 12 === 0;  // C note
+                        
+                        // Draw background for C octaves
+                        if (isC) {
+                            this.overlay.fillStyle = 'rgba(128, 128, 128, 0.05)';  // Adjusted for screen blend
+                            this.overlay.fillRect(0, y, width, keyHeight);
+                        }
+                        
+                        // Draw gridline
+                        this.overlay.strokeStyle = 'rgba(128, 128, 128, 0.1)';  // Adjusted for screen blend
+                        this.overlay.beginPath();
+                        this.overlay.moveTo(0, y);
+                        this.overlay.lineTo(width, y);
+                        this.overlay.stroke();
+                    }
+                    
+                    // Draw hover highlight if mouse is within canvas
+                    if (mouseY >= 0 && mouseY < height) {
+                        const keyIndex = Math.floor(mouseY / keyHeight);
+                        const keyY = keyIndex * keyHeight;
+                        this.overlay.fillStyle = 'rgba(128, 128, 128, 0.1)';  // Adjusted for screen blend
+                        this.overlay.fillRect(0, keyY, width, keyHeight);
+                    }
+                    
+                    // Reset to default blend mode
+                    this.overlay.globalCompositeOperation = 'source-over';
+                }
+            };
+
+            // ======== EVENT LISTENERS ========
+            window.addEventListener('resize', () => canvas.resize());
+            canvas.resize();
+
+            document.addEventListener('mousemove', (event) => {
+                const rect = canvas.overlay.canvas.getBoundingClientRect();
+                const mouseY = event.clientY - rect.top;
+                canvas.mouse = { x: event.clientX - rect.left, y: mouseY };
+
+                // Only process if mouse is within canvas bounds
+                if (mouseY >= 0 && mouseY < canvas.overlay.canvas.height) {
+                    // Convert mouse position to spectrogram scale
+                    const spectrogramY = (mouseY / canvas.overlay.canvas.height) * canvas.spec.canvas.height;
+                    const noteIndex = Math.floor(spectrogramY);
+                    const midiNote = CONFIG.midi.end - noteIndex;
+                    const freq = utils.midiToFreq(midiNote);
+                    const note = utils.freqToNoteData(freq);
+                    canvas.freqDisplay.innerHTML =
+                        `${String(Math.round(freq)).padEnd(4, ' ')}&nbsp;Hz&nbsp;&nbsp;` +
+                        `${String(note.noteName + note.octave).padEnd(3, ' ')} `;
+                }
+
+                // Update overlay
+                canvas.drawOverlay(mouseY);
+            });
+
+            // ======== AUDIO SETUP ========
+            let audioContext = null;
+            let source = null;
+            let analyser = null;
+            let audioBuffer = null;
+            let isPlaying = false;
+            let micStream = null;
+            let filterBank = null;
+
+            function initAudioContext() {
+                if (!audioContext) {
+                    audioContext = new AudioContext();
+                }
+                return audioContext.state === "suspended" ? audioContext.resume() : Promise.resolve();
+            }
+
+            function setupAudioNodes() {
+                if (source) {
+                    source.disconnect();
+                }
+                if (analyser) {
+                    analyser.disconnect();
+                }
+                
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = CONFIG.fft.size;
+                analyser.smoothingTimeConstant = CONFIG.fft.smoothing;
+                
+                // Initialize filterBank if not already done
+                if (!filterBank) {
+                    filterBank = utils.createNoteFilterBank(audioContext.sampleRate, CONFIG.fft.size);
+                }
+            }
+
+            async function startMicrophone() {
+                try {
+                    await initAudioContext();
+                    // Stop any playing audio file
+                    if (source && isPlaying) {
+                        source.stop();
+                    }
+                    
+                    micStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: true
+                        }
+                    });
+
+                    setupAudioNodes();
+                    source = audioContext.createMediaStreamSource(micStream);
+                    source.connect(analyser);
+                    isPlaying = true;
+
+                    if (!animationFrameId) {
+                        drawSpectrogram();
+                    }
+                } catch (error) {
+                    console.error('Error accessing microphone:', error);
+                }
+            }
+
+            function stopMicrophone() {
+                if (micStream) {
+                    micStream.getTracks().forEach(track => track.stop());
+                    micStream = null;
+                }
+                isPlaying = false;
+            }
+
+            // ======== FILE HANDLING ========
+            const fileInput = document.getElementById('fileInput');
+            const fileButton = document.getElementById('fileButton');
+            const micButton = document.getElementById('micButton');
+
+            fileButton.addEventListener('click', () => fileInput.click());
+            micButton.addEventListener('click', async () => {
+                if (micStream) {
+                    stopMicrophone();
+                    micButton.textContent = 'Use Microphone';
+                } else {
+                    await startMicrophone();
+                    micButton.textContent = 'Stop Microphone';
+                }
+            });
+
+            function handleFile(file) {
+                // Stop microphone if it's running
+                stopMicrophone();
+                micButton.textContent = 'Use Microphone';
+
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    try {
+                        await initAudioContext();
+                        const arrayBuffer = event.target.result;
+                        audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                        
+                        setupAudioNodes();
+                        source = audioContext.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.connect(analyser);
+                        source.connect(audioContext.destination);
+                        source.start(0);
+                        isPlaying = true;
+                        
+                        if (!animationFrameId) {
+                            drawSpectrogram();
+                        }
+                    } catch (error) {
+                        console.error('Error loading audio file:', error);
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+            }
+
+            fileInput.addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    handleFile(file);
+                }
+            });
+
+            let animationFrameId = null;
+
+            // ======== MAIN RENDER LOOP ========
+            function drawSpectrogram() {
+                animationFrameId = requestAnimationFrame(drawSpectrogram);
+
+                if (!analyser || !isPlaying) return;
+
+                const freqData = new Float32Array(analyser.frequencyBinCount);
+                analyser.getFloatFrequencyData(freqData);
+                const magnitude = freqData.map(db => Math.pow(10, db / 20));
+                let noteEnergies = utils.applyMelFilterBank(magnitude, filterBank);
+                
+                // Apply overtone suppression if enabled
+                if (overtoneSuppressionEnabled) {
+                    noteEnergies = overtoneUtils.suppressOvertones(noteEnergies);
+                }
+
+                const { width, height } = canvas.spec.canvas;
+                canvas.spec.putImageData(
+                    canvas.spec.getImageData(1, 0, width - 1, height),
+                    0, 0
+                );
+
+                noteEnergies.forEach((noteVal, i) => {
+                    const logVal = Math.log10(1 + noteVal * CONFIG.display.alpha) * CONFIG.display.scale;
+                    const intensity = Math.max(0, Math.min(1, logVal / CONFIG.display.scale));
+                    const color = COLORMAPS.viridis[Math.floor(intensity * (COLORMAPS.viridis.length - 1))]
+                        .map(c => Math.floor(c * 255));
+
+                    const y = NUM_NOTES - 1 - i;
+
+                    canvas.spec.fillStyle = `rgb(${color.join(',')})`;
+                    canvas.spec.fillRect(width - 1, y, 1, 1);
+                });
+
+                // Redraw overlay to ensure it stays on top
+                canvas.drawOverlay(canvas.mouse.y);
+            }
+
+            // Start with empty visualization
+            drawSpectrogram();
+
+            let overtoneSuppressionEnabled = false;
+            const overtoneMap = overtoneUtils.createOvertoneMap();
+            const overtoneButton = document.getElementById('overtoneSuppress');
+
+            overtoneButton.addEventListener('click', () => {
+                overtoneSuppressionEnabled = !overtoneSuppressionEnabled;
+                overtoneButton.classList.toggle('active', overtoneSuppressionEnabled);
+            });
+        })();
+    </script>
+</body>
+
+</html>
