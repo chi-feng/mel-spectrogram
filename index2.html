@@ -38,7 +38,6 @@
             const NUM_NOTES = CONFIG.midi.end - CONFIG.midi.start + 1;
 
             const OVERTONE_CONFIG = {
-                decayFactor: 0.5,  // Each overtone will be suppressed by this factor more than the previous
                 maxOvertones: 7,   // Number of overtones to consider
                 threshold: 0.0    // Minimum energy level to trigger suppression
             };
@@ -66,8 +65,8 @@
                     return Array.from({ length: NUM_NOTES }, (_, i) => {
                         const midi = CONFIG.midi.start + i;
                         const centerFreq = utils.midiToFreq(midi);
-                        const lowerFreq = centerFreq * Math.pow(2, -50 / 1200);
-                        const upperFreq = centerFreq * Math.pow(2, 50 / 1200);
+                        const lowerFreq = centerFreq * Math.pow(2, -33 / 1200);
+                        const upperFreq = centerFreq * Math.pow(2, 33 / 1200);
 
                         // Calculate exact (floating-point) bin positions
                         const centerBinExact = centerFreq * fftSize / sampleRate;
@@ -125,7 +124,7 @@
             };
 
             const overtoneUtils = {
-                // Create mapping of each note to its overtones
+                // Create mapping of each note to its overtones with triangular filters
                 createOvertoneMap() {
                     const overtoneMap = new Array(NUM_NOTES);
                     
@@ -135,13 +134,27 @@
                         
                         for (let n = 2; n <= OVERTONE_CONFIG.maxOvertones; n++) {
                             const overtoneFreq = fundamental * n;
-                            // Find the closest mel bin for this frequency
-                            const overtoneMidi = 12 * Math.log2(overtoneFreq / 440) + 69;
-                            const melBin = Math.round(overtoneMidi - CONFIG.midi.start);
+                            // Convert overtone frequency to MIDI note number (floating point)
+                            const overtoneMidiFloat = 12 * Math.log2(overtoneFreq / 440) + 69;
                             
-                            if (melBin < NUM_NOTES) {
+                            // Calculate the center bin and neighboring bins
+                            const centerBin = Math.round(overtoneMidiFloat - CONFIG.midi.start);
+                            const halfWidth = 1; // Adjust this value to control filter width
+                            
+                            // Only process if the overtone is within our note range
+                            if (centerBin < NUM_NOTES) {
+                                // Create triangular filter weights
+                                const weights = [];
+                                for (let offset = -halfWidth; offset <= halfWidth; offset++) {
+                                    const bin = centerBin + offset;
+                                    if (bin >= 0 && bin < NUM_NOTES) {
+                                        const weight = 1 - Math.abs(offset) / (halfWidth + 1);
+                                        weights.push({ bin, weight });
+                                    }
+                                }
+                                
                                 overtones.push({
-                                    bin: melBin,
+                                    bins: weights,
                                     multiplier: n
                                 });
                             }
@@ -152,24 +165,33 @@
                     return overtoneMap;
                 },
 
-                // Apply overtone suppression to mel energies
+                // Apply overtone suppression to mel energies using triangular filters
                 suppressOvertones(melEnergies) {
                     const suppressed = new Float32Array(melEnergies);
+                    const suppressionAmounts = new Float32Array(melEnergies.length).fill(0);
                     
-                    // Process from lowest to highest frequency
-                    for (let i = 0; i < suppressed.length; i++) {
-                        const energy = suppressed[i];
+                    // First pass: calculate all suppression amounts
+                    for (let i = 0; i < melEnergies.length; i++) {
+                        const energy = melEnergies[i];
                         
                         if (energy > OVERTONE_CONFIG.threshold) {
-                            // Suppress overtones for this fundamental
-                            overtoneMap[i].forEach(({bin, multiplier}, index) => {
-                                const suppressionFactor = Math.pow(OVERTONE_CONFIG.decayFactor, index + 1);
-                                const suppressionAmount = energy * suppressionFactor;
-                                if (bin < suppressed.length) {
-                                    suppressed[bin] = Math.max(0, suppressed[bin] - suppressionAmount);
-                                }
+                            // Calculate suppression for all overtones of this fundamental
+                            overtoneMap[i].forEach(({bins, multiplier}) => {
+                                const suppressionBase = 0.5 * energy / multiplier;
+                                
+                                // Apply weighted suppression to each bin in the filter
+                                bins.forEach(({bin, weight}) => {
+                                    if (bin < suppressionAmounts.length) {
+                                        suppressionAmounts[bin] += suppressionBase * weight;
+                                    }
+                                });
                             });
                         }
+                    }
+                    
+                    // Second pass: apply all suppressions at once
+                    for (let i = 0; i < suppressed.length; i++) {
+                        suppressed[i] = Math.max(0, melEnergies[i] - suppressionAmounts[i]);
                     }
                     
                     return suppressed;
@@ -182,6 +204,7 @@
                 overlay: document.getElementById('overlay').getContext('2d'),
                 freqDisplay: document.getElementById('freqDisplay'),
                 mouse: { x: 0, y: 0 },
+                currentEnergies: new Float32Array(NUM_NOTES),
 
                 resize() {
                     const width = window.innerWidth;
@@ -203,35 +226,36 @@
                     // Set blending mode to screen
                     this.overlay.globalCompositeOperation = 'screen';
                     
-                    // Calculate scaling factor between spectrogram and overlay
                     const scaleFactor = height / this.spec.canvas.height;
-                    const keyHeight = height / NUM_NOTES;  // Height of each key in overlay pixels
+                    const keyHeight = height / NUM_NOTES;
                     
                     // Draw all semitone gridlines and backgrounds
                     for (let midi = CONFIG.midi.start; midi <= CONFIG.midi.end; midi++) {
                         const noteIndex = midi - CONFIG.midi.start;
                         const y = (NUM_NOTES - 1 - noteIndex) * keyHeight;
-                        const isC = midi % 12 === 0;  // C note
-                        
-                        // Draw background for C octaves
-                        if (isC) {
-                            this.overlay.fillStyle = 'rgba(128, 128, 128, 0.05)';  // Adjusted for screen blend
-                            this.overlay.fillRect(0, y, width, keyHeight);
-                        }
                         
                         // Draw gridline
-                        this.overlay.strokeStyle = 'rgba(128, 128, 128, 0.1)';  // Adjusted for screen blend
+                        this.overlay.strokeStyle = 'rgba(128, 128, 128, 0.1)';
                         this.overlay.beginPath();
                         this.overlay.moveTo(0, y);
                         this.overlay.lineTo(width, y);
                         this.overlay.stroke();
+
+                        // Draw energy level
+                        // const energy = this.currentEnergies[NUM_NOTES - 1 - noteIndex];
+                        // if (energy > 0) {
+                        //     const logVal = Math.log10(1 + energy * CONFIG.display.alpha) * CONFIG.display.scale;
+                        //     const intensity = Math.max(0, Math.min(1, logVal / CONFIG.display.scale));
+                        //     this.overlay.fillStyle = `rgba(255, 255, 255, ${intensity * 0.3})`;
+                        //     this.overlay.fillRect(0, noteIndex * keyHeight, width, keyHeight);
+                        // }
                     }
                     
                     // Draw hover highlight if mouse is within canvas
                     if (mouseY >= 0 && mouseY < height) {
                         const keyIndex = Math.floor(mouseY / keyHeight);
                         const keyY = keyIndex * keyHeight;
-                        this.overlay.fillStyle = 'rgba(128, 128, 128, 0.1)';  // Adjusted for screen blend
+                        this.overlay.fillStyle = 'rgba(128, 128, 128, 0.1)';
                         this.overlay.fillRect(0, keyY, width, keyHeight);
                     }
                     
@@ -408,6 +432,9 @@
                     noteEnergies = overtoneUtils.suppressOvertones(noteEnergies);
                 }
 
+                // Update current energies
+                canvas.currentEnergies = noteEnergies;
+
                 const { width, height } = canvas.spec.canvas;
                 canvas.spec.putImageData(
                     canvas.spec.getImageData(1, 0, width - 1, height),
@@ -435,6 +462,7 @@
 
             let overtoneSuppressionEnabled = false;
             const overtoneMap = overtoneUtils.createOvertoneMap();
+            console.log(overtoneMap);
             const overtoneButton = document.getElementById('overtoneSuppress');
 
             overtoneButton.addEventListener('click', () => {
